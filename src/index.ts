@@ -10,7 +10,7 @@ const corsOptions = {
   methods: ["GET", "POST", "OPTIONS", "DELETE"],
   allowedHeaders: [
     "Content-Type",
-    "Authorization",
+    "Authorization", 
     "mcp-session-id",
     "X-Requested-With",
     "Accept",
@@ -45,10 +45,13 @@ app.options("/mcp", (req, res) => {
   res.sendStatus(200);
 });
 
+// Global session counter for unique IDs
+let sessionCounter = 0;
+
 // POST /mcp — JSON-RPC entry point
 app.post("/mcp", async (req, res) => {
   console.log('=== POST /mcp REQUEST ===');
-  console.log('Headers:', req.headers);
+  console.log('Method:', req.body?.method);
   console.log('Body:', JSON.stringify(req.body, null, 2));
   
   try {
@@ -56,34 +59,70 @@ app.post("/mcp", async (req, res) => {
     res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
     res.header("Access-Control-Allow-Credentials", "true");
 
-    const sessionId = req.get("mcp-session-id");
-    console.log('Session ID from request:', sessionId);
+    // Handle tool calls manually to bypass validation issues
+    if (req.body?.method === "tools/call" && req.body?.params?.name === "echo") {
+      console.log("🔧 Handling echo tool call manually");
+      
+      const message = req.body.params.arguments?.message || "No message provided";
+      console.log("🔧 Extracted message:", message);
+      
+      const response = {
+        jsonrpc: "2.0",
+        id: req.body.id,
+        result: {
+          content: [{ type: "text", text: message }]
+        }
+      };
+      
+      console.log("🔧 Sending manual response:", JSON.stringify(response, null, 2));
+      
+      res.setHeader("Content-Type", "application/json");
+      res.json(response);
+      return;
+    }
 
+    const sessionId = req.get("mcp-session-id");
     let transport: StreamableHTTPServerTransport;
 
     if (sessionId && transports[sessionId]) {
-      console.log('Using existing transport for session:', sessionId);
+      console.log('✅ Using existing session:', sessionId);
       transport = transports[sessionId];
     } else {
-      console.log('Creating new transport...');
-      transport = createMcpSession((newSessionId) => {
-        console.log('New session created:', newSessionId);
-        transports[newSessionId] = transport;
-        res.setHeader("mcp-session-id", newSessionId);
+      console.log('🆕 Creating new session...');
+      
+      // Create new session ID
+      const newSessionId = `session-${++sessionCounter}-${Date.now()}`;
+      
+      transport = new StreamableHTTPServerTransport({
+        onsessioninitialized: (sid) => {
+          console.log('🎯 Session initialized with ID:', sid);
+        },
       });
+
+      const server = new McpServer({
+        name: "echo-server",
+        version: "1.0.0",
+      });
+
+      // Don't register any tools to avoid validation issues
+      // We'll handle tool calls manually above
+      
+      server.connect(transport);
+      
+      // Store transport with our session ID
+      transports[newSessionId] = transport;
+      res.setHeader("mcp-session-id", newSessionId);
+      
+      console.log(`✅ New session created: ${newSessionId}`);
     }
 
-    console.log('Calling transport.handleRequest...');
-    
-    // Let the transport handle the request completely
+    // Let the transport handle non-tool requests (initialize, etc.)
     await transport.handleRequest(req, res, req.body);
-    
-    console.log('Transport handled request successfully');
     
   } catch (error) {
     console.error("❌ Error in POST /mcp:", error);
+    console.error("❌ Error stack:", error instanceof Error ? error.stack : 'No stack');
     
-    // Only send error response if headers haven't been sent
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -92,13 +131,13 @@ app.post("/mcp", async (req, res) => {
           message: "Internal server error",
           data: error instanceof Error ? error.message : String(error)
         },
-        id: null,
+        id: req.body?.id || null,
       });
     }
   }
 });
 
-// GET /mcp — open SSE stream
+// GET /mcp — SSE stream
 app.get("/mcp", async (req, res) => {
   try {
     const sessionId = req.get("mcp-session-id");
@@ -142,56 +181,6 @@ app.delete("/mcp", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// MCP Session Factory
-function createMcpSession(onSessionInit: (sid: string) => void): StreamableHTTPServerTransport {
-  const transport = new StreamableHTTPServerTransport({
-    onsessioninitialized: onSessionInit,
-  });
-
-  const server = new McpServer({
-    name: "echo-server",
-    version: "1.0.0",
-  });
-
-  server.registerTool(
-    "echo",
-    {
-      title: "Echo Tool",
-      description: "Echoes back the message sent",
-      inputSchema: {
-        type: "object",
-        properties: {
-          message: {
-            type: "string",
-            description: "The message to echo back"
-          }
-        },
-        required: ["message"]
-      }
-    },
-    async (args) => {
-      console.log("📨 Echo tool received args:", args);
-      const message = args.message || "No message provided";
-      console.log("📨 Echo tool message:", message);
-      
-      return {
-        content: [{ type: "text", text: message }],
-      };
-    }
-  );
-
-  server.connect(transport);
-
-  transport.onclose = () => {
-    if (transport.sessionId) {
-      console.log(`🔴 Session closed: ${transport.sessionId}`);
-      delete transports[transport.sessionId];
-    }
-  };
-
-  return transport;
-}
 
 // Start server
 const PORT = 3000;
